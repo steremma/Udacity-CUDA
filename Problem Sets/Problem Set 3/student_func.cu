@@ -79,7 +79,204 @@
 
 */
 
+
+#include "reference_calc.cpp"
 #include "utils.h"
+
+#define THREADS_PER_BLOCK 512
+
+
+typedef float (*ReductionOperator) (float, float);
+
+__device__ float minOperator(float x,float y)
+{
+  return min(x,y);
+}
+
+__device__ float maxOperator(float x,float y)
+{
+  return max(x,y);
+}
+
+__device__ ReductionOperator pMinOperator = minOperator;
+__device__ ReductionOperator pMaxOperator = maxOperator;
+
+__global__ void reduce(float* input,int inputSize,ReductionOperator op) 
+{
+  // initialize variables
+  extern __shared__ float sData[];
+  int tId = threadIdx.x;
+  int id = blockIdx.x * blockDim.x + tId;
+  if(id >= inputSize) {
+    return;
+  }
+
+  // load data into shared memory
+  sData[tId] = input[id];
+  __syncthreads();
+  
+  for(unsigned int d=blockDim.x/2; d>=1; d/=2) {
+    if(tId < d) {
+      //sData[tId] = min(sData[tId], sData[tId + d]);
+      sData[tId] = (*op)(sData[tId], sData[tId+d]);
+    }
+    __syncthreads();
+  }
+
+  // after the final iteration sData[0] holds the final result
+  if(tId == 0) {
+    input[blockIdx.x] = sData[0];
+  }
+}
+
+float extremeVal(const float* const d_logLuminance,int inputSize,bool minimum)
+{
+  ReductionOperator op;
+  if(minimum) {
+    cudaMemcpyFromSymbol(&op, pMinOperator, sizeof(ReductionOperator) );
+  }
+  else {
+    cudaMemcpyFromSymbol(&op, pMaxOperator, sizeof(ReductionOperator) );
+  }
+
+  // A temp table in global memory is needed since my input is const
+  float* d_temp;
+  checkCudaErrors(cudaMalloc((void**)&d_temp, sizeof(float) * inputSize)); 
+  checkCudaErrors(cudaMemcpy(d_temp, d_logLuminance, sizeof(float) * inputSize, cudaMemcpyDeviceToDevice));
+  
+  while(inputSize > THREADS_PER_BLOCK) {
+    int numBlocks = ceil((float)inputSize/THREADS_PER_BLOCK);
+    int memSize = sizeof(float)*THREADS_PER_BLOCK;
+    reduce<<<numBlocks,THREADS_PER_BLOCK,memSize>>>(d_temp,inputSize,op);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    inputSize = numBlocks;
+  } 
+  
+  
+  // launch 1 block to wrap up the calculation
+  int numBlocks = 1;
+  int memSize = sizeof(float)*inputSize;
+  reduce<<<numBlocks,inputSize,memSize>>>(d_temp,inputSize,op);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  // clean up
+  float extremeValue;
+  checkCudaErrors(cudaMemcpy(&extremeValue,d_temp,sizeof(float),cudaMemcpyDeviceToHost));
+  checkCudaErrors(cudaFree(d_temp));
+  return extremeValue;
+}
+
+__global__ void histogram(float* input,unsigned int* const histogram,const unsigned int inputSize,
+                     const unsigned int numBins,const float lumMin,const float lumMax)
+{
+  // initialize variables
+  extern __shared__ int localBins[];
+  int tId = threadIdx.x;
+  int id = blockIdx.x * blockDim.x + tId;
+  if(id >= inputSize) {
+    return;
+  }
+  if(tId < numBins) {
+    localBins[tId] = 0;
+  }
+  __syncthreads();
+
+  float range = lumMax - lumMin;
+  int binIdx = min(int(numBins * (input[id] - lumMin) / range),(numBins - 1));
+  atomicAdd(&localBins[binIdx],1);
+  __syncthreads();
+  if(tId < numBins) {
+    atomicAdd(&histogram[tId],localBins[tId]);
+  }
+}
+__global__ void slowHistogram(float* input,unsigned int* const histogram,const unsigned int inputSize,
+                     const unsigned int numBins,const float lumMin,const float lumMax)
+{
+  float range = lumMax - lumMin;
+  int id = threadIdx.x + blockDim.x*blockIdx.x;
+  if(id > inputSize) {
+    return;
+  }
+  int binIdx = int(numBins * (d_input[id] - lumMin) / range);
+
+  binIdx = min(numBins - 1, binIdx);
+  atomicAdd(&(d_histogram[binIdx]), 1);
+}
+
+void createHistogram(const float* const d_logLuminance,unsigned int* const d_cdf,
+                     const int inputSize,const int numBins,float minVal,float maxVal)
+{
+  cudaMemset(d_cdf, 0, sizeof(unsigned int) * numBins);
+  // create a mutable copy of the logLuminance array
+  float* d_temp;
+  checkCudaErrors(cudaMalloc((void**)&d_temp, sizeof(float) * inputSize)); 
+  checkCudaErrors(cudaMemcpy(d_temp, d_logLuminance, sizeof(float) * inputSize, cudaMemcpyDeviceToDevice));
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  int numBlocks = ceil((float)inputSize/THREADS_PER_BLOCK);
+  int memSize = sizeof(unsigned int) * numBins;
+  histogram<<<numBlocks,THREADS_PER_BLOCK,memSize>>>(d_temp,d_cdf,inputSize,numBins,minVal,maxVal);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+}
+
+// This could be a generic
+__device__ void swapPointers(unsigned int **a,unsigned int **b)
+{
+  unsigned int* temp = *a;
+  *a = *b;
+  *b = temp;
+}
+
+__global__ void prefixSum(unsigned int* input,unsigned int* output,int numBins)
+{
+  extern __shared__ unsigned int sharedMemory[];
+  unsigned int* sInput = sharedMemory;
+  unsigned int* sOutput = sharedMemory + numBins;
+
+  // assuming that only 1 block exists.
+  int id = threadIdx.x;
+  if(id >= numBins) {
+    return;
+  }
+
+  for(int stride=1;stride < numBins;stride *= 2) {
+    if(id + stride < numBins) {
+      sOutput[id + stride] = sInput[id] + sInput[id + stride];
+    }
+    if(id < stride) {
+      sOutput[id] = sInput[id];
+    }  
+    swapPointers(&sInput,&sOutput);
+    __syncthreads();
+  }
+  
+  output[id] = sInput[id];
+  
+}
+
+void prefixSum(unsigned int* const d_cdf,const size_t numBins)
+{  
+  // A mutable copy of the input is needed
+  unsigned int* d_input;
+  checkCudaErrors(cudaMalloc((void**)&d_input, sizeof(unsigned int) * numBins)); 
+  checkCudaErrors(cudaMemcpy(d_input, d_cdf, sizeof(unsigned int) * numBins, cudaMemcpyDeviceToDevice));
+
+  unsigned int* d_output;
+  checkCudaErrors(cudaMalloc((void**)&d_output, sizeof(unsigned int) * numBins)); 
+
+  int memSize = 2 * numBins * sizeof(unsigned int);
+  if(numBins > 1024) {
+    return;
+  }
+  prefixSum<<<1,numBins,memSize>>>(d_input,d_output,numBins);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  checkCudaErrors(cudaMemcpy(d_cdf + 1, d_output, sizeof(unsigned int) * (numBins - 1), cudaMemcpyDeviceToDevice));
+  checkCudaErrors(cudaFree(d_input));
+  checkCudaErrors(cudaFree(d_output));
+  checkCudaErrors(cudaMemset(d_cdf,0,sizeof(unsigned int)));
+
+}
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -89,6 +286,14 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   const size_t numCols,
                                   const size_t numBins)
 {
+  
+  // at this point min_logSum is computed
+  const int inputSize = numRows * numCols;
+  min_logLum = extremeVal(d_logLuminance,inputSize,1);
+  max_logLum = extremeVal(d_logLuminance,inputSize,0); 
+  createHistogram(d_logLuminance,d_cdf,inputSize,numBins,min_logLum,max_logLum);
+  prefixSum(d_cdf,numBins);
+
   //TODO
   /*Here are the steps you need to implement
     1) find the minimum and maximum value in the input logLuminance channel
@@ -99,6 +304,4 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
-
-
 }
