@@ -85,7 +85,11 @@
 
 #define THREADS_PER_BLOCK 512
 
-
+/*
+  In order to generalize my reduction i use function pointers.
+  This will now work with any such function as long as it is a
+  associative and binary, such as min,max or sum.
+*/
 typedef float (*ReductionOperator) (float, float);
 
 __device__ float minOperator(float x,float y)
@@ -101,6 +105,9 @@ __device__ float maxOperator(float x,float y)
 __device__ ReductionOperator pMinOperator = minOperator;
 __device__ ReductionOperator pMaxOperator = maxOperator;
 
+/*
+  A general reduction kernel using shared memory to increase performance.
+*/
 __global__ void reduce(float* input,int inputSize,ReductionOperator op) 
 {
   // initialize variables
@@ -129,6 +136,10 @@ __global__ void reduce(float* input,int inputSize,ReductionOperator op)
   }
 }
 
+/*
+  A case specific caller for the reduction kernel finding either a max
+  or min value depending on the boolean argument.
+*/
 float extremeVal(const float* const d_logLuminance,int inputSize,bool minimum)
 {
   ReductionOperator op;
@@ -165,8 +176,11 @@ float extremeVal(const float* const d_logLuminance,int inputSize,bool minimum)
   checkCudaErrors(cudaFree(d_temp));
   return extremeValue;
 }
-
-__global__ void histogram(float* input,unsigned int* const histogram,const unsigned int inputSize,
+/*
+  A fast histogram calculation kernel using shared memory. Each blocks computes its own
+  local copy of the histogram and then atomically contributes it to the global one.
+*/
+__global__ void histogram(const float* const input,unsigned int* const histogram,const unsigned int inputSize,
                      const unsigned int numBins,const float lumMin,const float lumMax)
 {
   // initialize variables
@@ -182,44 +196,57 @@ __global__ void histogram(float* input,unsigned int* const histogram,const unsig
   __syncthreads();
 
   float range = lumMax - lumMin;
-  int binIdx = min(int(numBins * (input[id] - lumMin) / range),(numBins - 1));
+
+  int binIdx = int(numBins * (input[id] - lumMin) / range);
+  binIdx = min(numBins - 1, binIdx);
+
   atomicAdd(&localBins[binIdx],1);
   __syncthreads();
   if(tId < numBins) {
     atomicAdd(&histogram[tId],localBins[tId]);
   }
 }
-__global__ void slowHistogram(float* input,unsigned int* const histogram,const unsigned int inputSize,
+
+/*
+  A slow implementation of the histogram kernel used to verify the faster one. 
+  Every thread directly (and atomically) writes to the global memory, thus
+  many collisions should be expected.
+*/
+__global__ void slowHistogram(const float* const input,unsigned int* const histogram,const unsigned int inputSize,
                      const unsigned int numBins,const float lumMin,const float lumMax)
 {
   float range = lumMax - lumMin;
-  int id = threadIdx.x + blockDim.x*blockIdx.x;
+  int id = threadIdx.x + blockDim.x * blockIdx.x;
   if(id > inputSize) {
     return;
   }
-  int binIdx = int(numBins * (d_input[id] - lumMin) / range);
+  int binIdx = int(numBins * (input[id] - lumMin) / range);
 
   binIdx = min(numBins - 1, binIdx);
-  atomicAdd(&(d_histogram[binIdx]), 1);
+  atomicAdd(&(histogram[binIdx]), 1);
 }
 
+/*
+  A caller of the histogram kernel, responsible for managing device memory pointers.
+*/
 void createHistogram(const float* const d_logLuminance,unsigned int* const d_cdf,
                      const int inputSize,const int numBins,float minVal,float maxVal)
 {
   cudaMemset(d_cdf, 0, sizeof(unsigned int) * numBins);
-  // create a mutable copy of the logLuminance array
-  float* d_temp;
-  checkCudaErrors(cudaMalloc((void**)&d_temp, sizeof(float) * inputSize)); 
-  checkCudaErrors(cudaMemcpy(d_temp, d_logLuminance, sizeof(float) * inputSize, cudaMemcpyDeviceToDevice));
   cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
   int numBlocks = ceil((float)inputSize/THREADS_PER_BLOCK);
-  int memSize = sizeof(unsigned int) * numBins;
-  histogram<<<numBlocks,THREADS_PER_BLOCK,memSize>>>(d_temp,d_cdf,inputSize,numBins,minVal,maxVal);
+  //int memSize = sizeof(unsigned int) * numBins;
+  //histogram<<<numBlocks,THREADS_PER_BLOCK,memSize>>>(d_logLuminance,d_cdf,inputSize,numBins,minVal,maxVal);
+  slowHistogram<<<numBlocks,THREADS_PER_BLOCK>>>(d_logLuminance,d_cdf,inputSize,numBins,minVal,maxVal);
   cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 }
 
-// This could be a generic
+/*
+  Swap two (int) pointers, this could be a template. Used to 
+  swap between what my program considers an input or an output
+  without copying any elements back and forth.
+*/
 __device__ void swapPointers(unsigned int **a,unsigned int **b)
 {
   unsigned int* temp = *a;
@@ -227,17 +254,26 @@ __device__ void swapPointers(unsigned int **a,unsigned int **b)
   *b = temp;
 }
 
+/*
+  A fast prefix Sum kernel using the Hillis - Steele algorithm. Uses 
+  two shared memory chunks which play the role of the input or the output
+  in turns at every iteration. Achieving more than 2x speed improvement
+  against an implementation that does not exploit shared memory.
+  NOTE: This will not work if the number of bins exceeds 1024.
+*/
 __global__ void prefixSum(unsigned int* input,unsigned int* output,int numBins)
 {
   extern __shared__ unsigned int sharedMemory[];
   unsigned int* sInput = sharedMemory;
   unsigned int* sOutput = sharedMemory + numBins;
-
+  
   // assuming that only 1 block exists.
   int id = threadIdx.x;
   if(id >= numBins) {
     return;
   }
+  sInput[id] = input[id];
+  __syncthreads();
 
   for(int stride=1;stride < numBins;stride *= 2) {
     if(id + stride < numBins) {
@@ -246,14 +282,18 @@ __global__ void prefixSum(unsigned int* input,unsigned int* output,int numBins)
     if(id < stride) {
       sOutput[id] = sInput[id];
     }  
-    swapPointers(&sInput,&sOutput);
     __syncthreads();
+    swapPointers(&sInput,&sOutput);
   }
   
   output[id] = sInput[id];
   
 }
-
+/*
+  A kernel caller for my prefix sum function, responsible for managing
+  device pointers. Care has been taken to transform the inclusive scan
+  into exclusive with minimal memory access.
+*/
 void prefixSum(unsigned int* const d_cdf,const size_t numBins)
 {  
   // A mutable copy of the input is needed
@@ -271,13 +311,18 @@ void prefixSum(unsigned int* const d_cdf,const size_t numBins)
   prefixSum<<<1,numBins,memSize>>>(d_input,d_output,numBins);
   cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
+  // Transform inclusive scan into exclusive.
   checkCudaErrors(cudaMemcpy(d_cdf + 1, d_output, sizeof(unsigned int) * (numBins - 1), cudaMemcpyDeviceToDevice));
+
+  // clean up
   checkCudaErrors(cudaFree(d_input));
   checkCudaErrors(cudaFree(d_output));
   checkCudaErrors(cudaMemset(d_cdf,0,sizeof(unsigned int)));
-
 }
 
+/*
+  Main function called to perform histogram equilization on an image.
+*/
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
                                   float &min_logLum,
@@ -285,23 +330,20 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   const size_t numRows,
                                   const size_t numCols,
                                   const size_t numBins)
-{
-  
-  // at this point min_logSum is computed
+{ 
   const int inputSize = numRows * numCols;
+
+  /*  1) find the minimum and maximum value in the input logLuminance channel
+       store in min_logLum and max_logLum  */
   min_logLum = extremeVal(d_logLuminance,inputSize,1);
   max_logLum = extremeVal(d_logLuminance,inputSize,0); 
-  createHistogram(d_logLuminance,d_cdf,inputSize,numBins,min_logLum,max_logLum);
-  prefixSum(d_cdf,numBins);
 
-  //TODO
-  /*Here are the steps you need to implement
-    1) find the minimum and maximum value in the input logLuminance channel
-       store in min_logLum and max_logLum
-    2) subtract them to find the range
-    3) generate a histogram of all the values in the logLuminance channel using
-       the formula: bin = (lum[i] - lumMin) / lumRange * numBins
-    4) Perform an exclusive scan (prefix sum) on the histogram to get
+  /*  3) generate a histogram of all the values in the logLuminance channel using
+       the formula: bin = (lum[i] - lumMin) / lumRange * numBins */
+  createHistogram(d_logLuminance,d_cdf,inputSize,numBins,min_logLum,max_logLum);
+
+  /* 4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
-       incoming d_cdf pointer which already has been allocated for you)       */
+       incoming d_cdf pointer which already has been allocated for you)    */
+  prefixSum(d_cdf,numBins);
 }
