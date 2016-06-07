@@ -26,18 +26,42 @@
 
 
 #include "utils.h"
+#include <stdio.h>
+#include <math.h>
+#define THREADS_PER_BLOCK 1024
 
-__global__
-void yourHisto(const unsigned int* const vals, //INPUT
+__global__ void slowHisto(const unsigned int* const vals, //INPUT
                unsigned int* const histo,      //OUPUT
-               int numVals)
+               int numVals, int numBins)
 {
-  //TODO fill in this kernel to calculate the histogram
-  //as quickly as possible
+  // Shared memory allocation for the local histogram
+  int id = blockDim.x * blockIdx.x + threadIdx.x;
 
-  //Although we provide only one kernel skeleton,
-  //feel free to use more if it will help you
-  //write faster code
+  if(id >= numVals) return;
+  
+  atomicAdd(&histo[vals[id]], 1);
+}
+
+__global__ void yourHisto(const unsigned int* const vals, //INPUT
+               unsigned int* const histo,      //OUPUT
+               int numVals, int numBins)
+{
+  // Shared memory allocation for the local histogram
+  extern __shared__ unsigned int sh[];
+  int id = blockDim.x * blockIdx.x + threadIdx.x;
+  
+  if(id >= numVals) return;
+
+  if(threadIdx.x < numBins) sh[threadIdx.x] = 0;
+  __syncthreads();
+
+  atomicAdd(&sh[vals[id]], 1);
+  __syncthreads();
+
+  // atomically add the local histogram to the global one
+  if(threadIdx.x < numBins) {
+    atomicAdd(&histo[threadIdx.x], sh[threadIdx.x]);
+  }
 }
 
 void computeHistogram(const unsigned int* const d_vals, //INPUT
@@ -46,9 +70,16 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
                       const unsigned int numElems)
 {
   //TODO Launch the yourHisto kernel
-
   //if you want to use/launch more than one kernel,
   //feel free
+  dim3 threads(THREADS_PER_BLOCK);
+  dim3 blocks(ceil((float)numElems / THREADS_PER_BLOCK));
+  size_t memSize = numBins * sizeof(unsigned int);
+  if(numBins <= THREADS_PER_BLOCK) {
+    yourHisto<<<blocks, threads, memSize>>>(d_vals, d_histo, numElems, numBins);
+  }
+  else printf("we got a problem... \n");
 
+  
   cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 }
